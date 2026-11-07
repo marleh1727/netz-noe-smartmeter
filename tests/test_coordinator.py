@@ -21,7 +21,7 @@ from custom_components.netz_noe_smartmeter.api import (
     NetzNoeRateLimitError,
 )
 from custom_components.netz_noe_smartmeter.const import DOMAIN
-from custom_components.netz_noe_smartmeter.coordinator import NetzNoeCoordinator, NetzNoeData
+from custom_components.netz_noe_smartmeter.coordinator import NetzNoeCoordinator, NetzNoeData, peak_from_raw
 
 from .conftest import (
     MOCK_CONFIG_DATA,
@@ -431,5 +431,104 @@ async def test_first_refresh_skips_raw_data(hass: HomeAssistant) -> None:
     ):
         data = await coord._async_update_data()
 
-    api.get_raw.assert_called_once()
+    # The 5-day window for statistics comes first; month requests for the peaks follow
+    first_raw_call = api.get_raw.call_args_list[0].args
+    assert first_raw_call[2] - first_raw_call[1] == timedelta(days=5)
     assert data.raw_records == MOCK_RAW_RESPONSE
+
+
+# -- Monthly peaks from raw data --
+
+
+def _raw(endtime: str, kwh: float) -> dict[str, object]:
+    """Build a raw 15-min record."""
+    return {"MeasuredValue": kwh, "Endtime": endtime}
+
+
+def test_peak_from_raw_takes_highest_interval_times_four() -> None:
+    """Test the peak is the highest 15-min energy times four, timed at the interval start."""
+    records = [
+        _raw("2026-03-10T07:15:00", 0.5),
+        _raw("2026-03-10T07:30:00", 1.25),
+        _raw("2026-03-10T07:45:00", None),
+        _raw("2026-03-10T08:00:00", 0.9),
+    ]
+    # 1.25 kWh in 15 min = 5 kW; Endtime 07:30 UTC = interval 07:15 UTC = 08:15 Vienna (CET)
+    assert peak_from_raw(records, 2026, 3) == (5.0, "2026-03-10T08:15:00+01:00")
+
+
+def test_peak_from_raw_assigns_intervals_to_local_month() -> None:
+    """Test intervals belong to the month they start in, in Vienna time."""
+    records = [
+        # Starts 2026-10-31 23:45 Vienna -> October
+        _raw("2026-10-31T23:00:00", 2.0),
+        # Starts 2026-11-01 00:00 Vienna -> November
+        _raw("2026-10-31T23:15:00", 1.0),
+    ]
+    assert peak_from_raw(records, 2026, 10) == (8.0, "2026-10-31T23:45:00+01:00")
+    assert peak_from_raw(records, 2026, 11) == (4.0, "2026-11-01T00:00:00+01:00")
+    assert peak_from_raw([], 2026, 11) is None
+
+
+async def test_peaks_filled_from_raw_when_portal_reports_none(hass: HomeAssistant) -> None:
+    """Test empty portal peaks are worked out from raw data and completed months are cached."""
+    newest = date(2026, 3, 5)
+
+    async def get_raw(_meter_id: str, start: date, _end: date) -> list[dict[str, object]]:
+        if start.day != 1:  # the 5-day statistics window
+            return []
+        return [_raw(f"{start.year}-{start.month:02d}-02T10:15:00", start.month / 10)]
+
+    api = _mock_api(
+        get_year=AsyncMock(
+            return_value={"values": [1.0] * 12, "peakDemands": [None] * 12, "peakDemandTimes": [None] * 12}
+        ),
+        get_raw=AsyncMock(side_effect=get_raw),
+    )
+    coord = _make_coordinator(hass, api)
+    data = NetzNoeData(monthly_peaks=[None] * 12, prev_year_monthly_peaks=[None] * 12, prev_year=2025)
+
+    await coord._fill_peaks_from_raw(data, newest)
+
+    assert api.get_raw.await_count == 15  # 12 months of 2025 + Jan to Mar 2026
+    assert data.monthly_peaks[:4] == [0.4, 0.8, 1.2, None]
+    assert data.monthly_peak_times[1] == "2026-02-02T11:00:00+01:00"
+    assert data.prev_year_monthly_peaks[11] == 4.8
+    assert data.monthly_peak == 1.2
+
+    # Completed months are cached; only the current month is fetched again
+    data = NetzNoeData(monthly_peaks=[None] * 12, prev_year_monthly_peaks=[None] * 12, prev_year=2025)
+    await coord._fill_peaks_from_raw(data, newest)
+    assert api.get_raw.await_count == 16
+    assert data.monthly_peaks[:3] == [0.4, 0.8, 1.2]
+
+
+async def test_portal_peaks_take_precedence(hass: HomeAssistant) -> None:
+    """Test months with a portal peak are not fetched from raw data."""
+    api = _mock_api(get_raw=AsyncMock(return_value=[]))
+    coord = _make_coordinator(hass, api)
+    data = NetzNoeData(
+        monthly_peaks=[3.0, 2.0] + [None] * 10,
+        monthly_peak_times=["2026-01-05T17:00:00", "2026-02-05T17:00:00"] + [None] * 10,
+        prev_year_monthly_peaks=[1.0] * 12,
+        prev_year=2025,
+        monthly_peak=2.0,
+    )
+
+    await coord._fill_peaks_from_raw(data, date(2026, 2, 10))
+
+    api.get_raw.assert_not_called()
+    assert data.monthly_peaks[:2] == [3.0, 2.0]
+    assert data.monthly_peak == 2.0
+
+
+async def test_peaks_stop_on_rate_limit(hass: HomeAssistant) -> None:
+    """Test a rate limit stops the month requests without failing the poll."""
+    api = _mock_api(get_raw=AsyncMock(side_effect=NetzNoeRateLimitError("429")))
+    coord = _make_coordinator(hass, api)
+    data = NetzNoeData(monthly_peaks=[None] * 12, prev_year_monthly_peaks=[None] * 12, prev_year=2025)
+
+    await coord._fill_peaks_from_raw(data, date(2026, 3, 5))
+
+    assert api.get_raw.await_count == 1
+    assert data.monthly_peak is None

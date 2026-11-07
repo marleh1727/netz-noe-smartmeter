@@ -67,6 +67,13 @@ def auto_enable_custom_integrations(
     """Enable custom integrations and recorder for all tests."""
 
 
+@pytest.fixture(autouse=True)
+def no_peak_request_delay() -> Generator[None]:
+    """Skip the pause between the month requests for the monthly peaks."""
+    with patch("custom_components.netz_noe_smartmeter.coordinator.PEAK_REQUEST_DELAY_SECONDS", 0):
+        yield
+
+
 @pytest.fixture
 def mock_setup_entry() -> Generator[AsyncMock]:
     """Prevent the created config entry from being set up against the real API."""

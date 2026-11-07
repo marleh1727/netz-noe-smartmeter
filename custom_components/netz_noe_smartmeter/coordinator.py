@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 from typing import cast, override
 
 import aiohttp
@@ -33,6 +33,49 @@ from .statistics import async_import_raw_statistics
 _LOGGER = logging.getLogger(__name__)
 
 _POLL_FATAL_ERRORS = (NetzNoeLoginError, NetzNoeMaintenanceError, NetzNoeRateLimitError)
+
+# Pause between the month requests used to work out the monthly peaks
+PEAK_REQUEST_DELAY_SECONDS = 1.0
+
+_PORTAL_TIME_ZONE = dt_util.get_time_zone("Europe/Vienna") or UTC
+
+# A month's peak: demand in kW and the start of its 15-min interval (ISO, Vienna time)
+type MonthPeak = tuple[float, str]
+
+
+def peak_from_raw(records: list[RawRecord], year: int, month: int) -> MonthPeak | None:
+    """Return the highest 15-min demand of a month from raw records.
+
+    The demand of an interval is its energy times four (kWh per 15 min to kW),
+    which is how the monthly peak for the demand charge is defined. Endtime is
+    the end of the interval; intervals are assigned to the month they start in,
+    in Austrian local time.
+    """
+    best: tuple[float, str] | None = None
+    for record in records:
+        value = record.get("MeasuredValue")
+        endtime = record.get("Endtime")
+        if value is None or endtime is None:
+            continue
+        end = dt_util.parse_datetime(endtime)
+        if end is None:
+            continue
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        start = (end - timedelta(minutes=15)).astimezone(_PORTAL_TIME_ZONE)
+        if (start.year, start.month) != (year, month):
+            continue
+        demand = float(value) * 4
+        if best is None or demand > best[0]:
+            best = (demand, start.isoformat())
+    if best is None:
+        return None
+    return round(best[0], 3), best[1]
+
+
+def _first_of_next_month(year: int, month: int) -> date:
+    """Return the first day of the month after the given one."""
+    return date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
 
 
 @dataclass
@@ -121,6 +164,8 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
         self.meter_id = config_data[CONF_METER_ID]
         self._first_refresh = True
         self.backfill_progress = BackfillProgress()
+        # Peaks of completed months, worked out from raw data once per session
+        self._peak_cache: dict[tuple[int, int], MonthPeak | None] = {}
 
     @override
     async def _async_update_data(self) -> NetzNoeData:
@@ -165,6 +210,7 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
             self._fetch_prev_year(data, newest),
         ]
 
+        full_refresh = not self._first_refresh
         if self._first_refresh:
             self._first_refresh = False
             _LOGGER.debug("First refresh — skipping raw data fetch, will schedule full refresh")
@@ -172,6 +218,10 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
             tasks.append(self._fetch_raw(data, today))
 
         _ = await asyncio.gather(*tasks)
+
+        # Monthly peaks need raw data per month, so they are skipped on the fast first refresh too
+        if full_refresh:
+            await self._fill_peaks_from_raw(data, newest)
 
         # Import raw 15-min data as hourly statistics for Energy Dashboard
         if data.raw_records:
@@ -275,6 +325,72 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
             raise
         except NetzNoeApiError as err:
             _LOGGER.debug("No previous year data for %d: %s", prev_year, err)
+
+    async def _fill_peaks_from_raw(self, data: NetzNoeData, newest: date) -> None:
+        """Fill in monthly peaks the Year endpoint left empty, from raw 15-min data.
+
+        The portal only reports monthly peaks for meters billed on measured
+        demand. For all others the peak is worked out from the raw values.
+        Completed months are fetched once and cached; the current month is
+        fetched on every full refresh. On an error the remaining months are
+        left for the next refresh.
+        """
+        months = [(newest.year - 1, m) for m in range(1, 13)]
+        months += [(newest.year, m) for m in range(1, newest.month + 1)]
+        current: dict[tuple[int, int], MonthPeak | None] = {}
+        requests = 0
+
+        for key in months:
+            year, month = key
+            complete = key < (newest.year, newest.month)
+            if complete and key in self._peak_cache:
+                continue
+            portal_peaks = data.monthly_peaks if year == newest.year else data.prev_year_monthly_peaks
+            if len(portal_peaks) >= month and portal_peaks[month - 1] is not None:
+                continue
+            if requests:
+                await asyncio.sleep(PEAK_REQUEST_DELAY_SECONDS)
+            requests += 1
+            try:
+                records = await self.api.get_raw(self.meter_id, date(year, month, 1), _first_of_next_month(year, month))
+            except NetzNoeRateLimitError:
+                _LOGGER.debug("Rate limited while fetching monthly peaks, continuing next refresh")
+                break
+            except _POLL_FATAL_ERRORS:
+                raise
+            except NetzNoeApiError as err:
+                _LOGGER.warning("Failed to fetch raw data for the %d-%02d peak: %s", year, month, err)
+                break
+            peak = peak_from_raw(records, year, month)
+            if complete:
+                self._peak_cache[key] = peak
+            else:
+                current[key] = peak
+
+        def fill(
+            year: int, peaks: list[float | None], times: list[str | None]
+        ) -> tuple[list[float | None], list[str | None]]:
+            peaks = (list(peaks) + [None] * 12)[:12]
+            times = (list(times) + [None] * 12)[:12]
+            for i in range(12):
+                if peaks[i] is not None:
+                    continue
+                peak = self._peak_cache.get((year, i + 1)) or current.get((year, i + 1))
+                if peak is not None:
+                    peaks[i], times[i] = peak
+            return peaks, times
+
+        data.monthly_peaks, data.monthly_peak_times = fill(newest.year, data.monthly_peaks, data.monthly_peak_times)
+        data.prev_year_monthly_peaks, data.prev_year_monthly_peak_times = fill(
+            newest.year - 1, data.prev_year_monthly_peaks, data.prev_year_monthly_peak_times
+        )
+        if data.prev_year is None:
+            data.prev_year = newest.year - 1
+
+        month_index = newest.month - 1
+        if data.monthly_peak is None and data.monthly_peaks[month_index] is not None:
+            data.monthly_peak = data.monthly_peaks[month_index]
+            data.monthly_peak_time = data.monthly_peak_times[month_index]
 
     async def _fetch_raw(self, data: NetzNoeData, today: date) -> None:
         """Fetch raw data for the last 5 days (for statistics import)."""
