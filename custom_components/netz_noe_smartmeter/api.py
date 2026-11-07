@@ -49,9 +49,11 @@ class WeekResponse(TypedDict, total=False):
 
 
 class YearResponse(TypedDict, total=False):
-    """Year endpoint response: monthly totals for a year."""
+    """Year endpoint response: monthly totals and peaks for a year."""
 
     values: list[float | None]
+    peakDemands: list[float | None]
+    peakDemandTimes: list[str | None]
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +294,8 @@ class NetzNoeApi:
 
         Returns dict with:
           values: list of 12 float|None (kWh per month)
-          peakDemands: list of 12 float|None
+          peakDemands: list of 12 float|None (highest 15-min demand per month, kW)
+          peakDemandTimes: list of 12 ISO timestamps|None (UTC, without offset)
         """
         params = {
             "meterId": meter_id,

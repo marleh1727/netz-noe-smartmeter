@@ -54,6 +54,9 @@
       "yearly_consumption": {
         "name": "Yearly consumption"
       },
+      "monthly_peak_demand": {
+        "name": "Monthly peak demand"
+      },
       "last_updated": {
         "name": "Last updated"
       },

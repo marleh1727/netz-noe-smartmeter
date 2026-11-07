@@ -34,6 +34,21 @@ MOCK_WEEK_RESPONSE = {
 
 MOCK_YEAR_RESPONSE = {
     "values": [10.0, 20.0, 30.0, None, None, None, None, None, None, None, None, None],
+    "peakDemands": [4.2, 3.1, 2.5, None, None, None, None, None, None, None, None, None],
+    "peakDemandTimes": [
+        "2025-01-08T17:15:00",
+        "2025-02-03T06:30:00",
+        "2025-03-12T18:00:00",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ],
 }
 
 MOCK_RAW_RESPONSE = [

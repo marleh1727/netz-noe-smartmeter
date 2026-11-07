@@ -14,7 +14,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, UnitOfEnergy
+from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -48,6 +48,7 @@ async def async_setup_entry(
         NetzNoeWeeklyConsumptionSensor(coordinator, meter_id),
         NetzNoeMonthlyConsumptionSensor(coordinator, meter_id),
         NetzNoeYearlyConsumptionSensor(coordinator, meter_id),
+        NetzNoeMonthlyPeakDemandSensor(coordinator, meter_id),
         NetzNoeLastUpdatedSensor(coordinator, meter_id),
         NetzNoeBackfillStatusSensor(coordinator, meter_id),
     ]
@@ -274,6 +275,76 @@ class NetzNoeYearlyConsumptionSensor(NetzNoeConsumptionSensor):
             for i, val in enumerate(prev_monthly[:12]):
                 if val is not None:
                     attrs[f"{self.MONTH_NAMES[i]}_{prev_year}"] = round(val, 3)
+
+        return attrs
+
+
+_PORTAL_TIME_ZONE = dt_util.get_time_zone("Europe/Vienna") or UTC
+
+
+def _peak_time_local(value: str | None) -> str | None:
+    """Convert a portal peak timestamp (UTC without offset) to local Austrian time."""
+    if not value:
+        return None
+    parsed = dt_util.parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(_PORTAL_TIME_ZONE).isoformat()
+
+
+class NetzNoeMonthlyPeakDemandSensor(NetzNoeSensorBase):
+    """Sensor for the highest 15-min demand of the current month.
+
+    This is the value the demand charge (Leistungspreis) is billed on. The
+    attributes hold the peak and its time for every month of the current and
+    the previous year.
+    """
+
+    _attr_device_class: SensorDeviceClass | None = SensorDeviceClass.POWER
+    _attr_state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement: str | None = UnitOfPower.KILO_WATT
+    _attr_suggested_display_precision: int | None = 3
+    _attr_icon: str | None = "mdi:flash-alert"
+
+    def __init__(self, coordinator: NetzNoeCoordinator, meter_id: str) -> None:
+        """Initialize."""
+        super().__init__(coordinator, meter_id, "monthly_peak_demand")
+
+    @cached_property
+    @override
+    def native_value(self) -> float | None:
+        """Return the current month's highest 15-min demand."""
+        data = cast(NetzNoeData | None, self.coordinator.data)
+        if data is None:
+            return None
+        return data.monthly_peak
+
+    @cached_property
+    @override
+    def extra_state_attributes(self) -> dict[str, float | str | None] | None:
+        """Return the peak and its time for every month as attributes."""
+        data = cast(NetzNoeData | None, self.coordinator.data)
+        if data is None:
+            return None
+
+        names = NetzNoeYearlyConsumptionSensor.MONTH_NAMES
+        attrs: dict[str, float | str | None] = {"zeitpunkt": _peak_time_local(data.monthly_peak_time)}
+
+        for i, val in enumerate(data.monthly_peaks[:12]):
+            attrs[names[i]] = round(val, 3) if val is not None else None
+            time = data.monthly_peak_times[i] if i < len(data.monthly_peak_times) else None
+            attrs[f"{names[i]}_zeit"] = _peak_time_local(time) if val is not None else None
+
+        if data.prev_year is not None:
+            for i, val in enumerate(data.prev_year_monthly_peaks[:12]):
+                if val is None:
+                    continue
+                key = f"{names[i]}_{data.prev_year}"
+                attrs[key] = round(val, 3)
+                times = data.prev_year_monthly_peak_times
+                attrs[f"{key}_zeit"] = _peak_time_local(times[i] if i < len(times) else None)
 
         return attrs
 

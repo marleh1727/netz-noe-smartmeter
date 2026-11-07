@@ -54,6 +54,9 @@
       "yearly_consumption": {
         "name": "Jahresverbrauch"
       },
+      "monthly_peak_demand": {
+        "name": "Leistungsspitze Monat"
+      },
       "last_updated": {
         "name": "Letztes Update"
       },

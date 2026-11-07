@@ -74,6 +74,15 @@ class NetzNoeData:
     # Previous year monthly totals (for invoice comparison)
     prev_year: int | None = None
     prev_year_monthly_values: list[float | None] = field(default_factory=list)
+    # Highest 15-min demand per month (kW) and when it occurred (Year endpoint),
+    # the basis of the demand charge
+    monthly_peaks: list[float | None] = field(default_factory=list)
+    monthly_peak_times: list[str | None] = field(default_factory=list)
+    # Peak of the month containing the newest day (kW) and its time
+    monthly_peak: float | None = None
+    monthly_peak_time: str | None = None
+    prev_year_monthly_peaks: list[float | None] = field(default_factory=list)
+    prev_year_monthly_peak_times: list[str | None] = field(default_factory=list)
     # Timestamp of the newest data point
     last_data_timestamp: str | None = None
     # Raw records for statistics import
@@ -237,6 +246,15 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
             non_null_monthly = [v for v in monthly if v is not None]
             data.yearly_total = round(sum(non_null_monthly), 3) if non_null_monthly else None
             data.year_start = newest.replace(month=1, day=1)
+
+            peaks = year_data.get("peakDemands", [])
+            peak_times = year_data.get("peakDemandTimes", [])
+            data.monthly_peaks = peaks
+            data.monthly_peak_times = peak_times
+            month_index = newest.month - 1
+            if len(peaks) > month_index and peaks[month_index] is not None:
+                data.monthly_peak = round(peaks[month_index], 3)
+                data.monthly_peak_time = peak_times[month_index] if len(peak_times) > month_index else None
         except _POLL_FATAL_ERRORS:
             raise
         except NetzNoeApiError as err:
@@ -250,6 +268,8 @@ class NetzNoeCoordinator(DataUpdateCoordinator[NetzNoeData]):
             prev_monthly = prev_data.get("values", [])
             data.prev_year = prev_year
             data.prev_year_monthly_values = prev_monthly
+            data.prev_year_monthly_peaks = prev_data.get("peakDemands", [])
+            data.prev_year_monthly_peak_times = prev_data.get("peakDemandTimes", [])
             _LOGGER.debug("Previous year %d data fetched", prev_year)
         except _POLL_FATAL_ERRORS:
             raise

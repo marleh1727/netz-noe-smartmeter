@@ -92,6 +92,11 @@ async def test_update_data_success(hass: HomeAssistant) -> None:
     assert data.monthly_values == MOCK_YEAR_RESPONSE["values"]
     assert data.yearly_total == pytest.approx(60.0)
 
+    # Monthly peaks from the year response
+    assert data.monthly_peaks == MOCK_YEAR_RESPONSE["peakDemands"]
+    assert data.monthly_peak_times == MOCK_YEAR_RESPONSE["peakDemandTimes"]
+    assert data.prev_year_monthly_peaks == MOCK_YEAR_RESPONSE["peakDemands"]
+
     # Raw records are imported as statistics
     assert data.raw_records == MOCK_RAW_RESPONSE
     mock_import.assert_awaited_once_with(hass, MOCK_METER_ID, MOCK_RAW_RESPONSE)

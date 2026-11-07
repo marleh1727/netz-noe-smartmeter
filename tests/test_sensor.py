@@ -15,6 +15,7 @@ from custom_components.netz_noe_smartmeter.sensor import (
     NetzNoeDailyConsumptionSensor,
     NetzNoeLastUpdatedSensor,
     NetzNoeMonthlyConsumptionSensor,
+    NetzNoeMonthlyPeakDemandSensor,
     NetzNoeSensorBase,
     NetzNoeWeeklyConsumptionSensor,
     NetzNoeYearlyConsumptionSensor,
@@ -93,6 +94,46 @@ class TestSensorStateClass:
         """Test last_reset is None when there is no data or the period is unknown."""
         assert _make_sensor(NetzNoeDailyConsumptionSensor, None).last_reset is None
         assert _make_sensor(NetzNoeDailyConsumptionSensor, NetzNoeData()).last_reset is None
+
+
+class TestMonthlyPeakDemand:
+    """Tests for the monthly peak demand sensor."""
+
+    def test_state_is_current_month_peak(self) -> None:
+        """Test the state is the peak of the month containing the newest day."""
+        sensor = _make_sensor(NetzNoeMonthlyPeakDemandSensor, NetzNoeData(monthly_peak=4.2))
+        assert sensor.native_value == 4.2
+
+    def test_none_without_data(self) -> None:
+        """Test state and attributes are None without coordinator data."""
+        sensor = _make_sensor(NetzNoeMonthlyPeakDemandSensor, None)
+        assert sensor.native_value is None
+        assert sensor.extra_state_attributes is None
+
+    def test_attributes_per_month_in_local_time(self) -> None:
+        """Test peaks and their times per month, converted from UTC to Vienna time."""
+        data = NetzNoeData(
+            monthly_peaks=[4.2, 3.1234, None] + [None] * 9,
+            monthly_peak_times=["2025-01-08T17:15:00", "2025-07-03T06:30:00", None] + [None] * 9,
+            monthly_peak=3.123,
+            monthly_peak_time="2025-07-03T06:30:00",
+            prev_year=2024,
+            prev_year_monthly_peaks=[5.5, None] + [None] * 10,
+            prev_year_monthly_peak_times=["2024-01-20T19:45:00", None] + [None] * 10,
+        )
+        attrs = _make_sensor(NetzNoeMonthlyPeakDemandSensor, data).extra_state_attributes
+
+        assert attrs is not None
+        assert attrs["jan"] == 4.2
+        assert attrs["jan_zeit"] == "2025-01-08T18:15:00+01:00"
+        assert attrs["feb"] == 3.123
+        assert attrs["feb_zeit"] == "2025-07-03T08:30:00+02:00"
+        assert attrs["mar"] is None
+        assert attrs["mar_zeit"] is None
+        assert attrs["zeitpunkt"] == "2025-07-03T08:30:00+02:00"
+        assert attrs["jan_2024"] == 5.5
+        assert attrs["jan_2024_zeit"] == "2024-01-20T20:45:00+01:00"
+        assert "feb_2024" not in attrs
 
 
 class TestYearlyAttributes:
